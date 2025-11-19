@@ -1,0 +1,26 @@
+# Standard requirements.txt format for Vision Transformer PyTorch implementation
+# Generated from conda explicit format
+
+# Core ML/DL libraries
+torch
+torchvision
+torchaudio
+numpy
+
+# Image processing
+Pillow
+
+# Jupyter notebook support
+jupyter
+notebook
+ipykernel
+ipywidgets
+
+# Development tools
+setuptools
+wheel
+pip
+
+# Additional utilities
+six
+certifi
