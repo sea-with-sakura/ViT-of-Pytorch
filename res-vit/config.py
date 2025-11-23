@@ -149,7 +149,7 @@ def get_train_config():
     parser.add_argument("--train-steps", type=int, default=15000, help="number of training/fine-tunning steps")
     parser.add_argument("--warmup-steps", type=int, default=500, help="learning rate warm up steps")
     parser.add_argument("--print-freq", type=int, default=100, help="print frequency")
-    parser.add_argument("--device", type=str, default='cuda:4', help="device to use for training")
+    parser.add_argument("--device", type=str, default='cuda:2', help="device to use for training")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
 
     # AdamW optimizer hyperparameters
@@ -165,25 +165,26 @@ def get_train_config():
     parser.add_argument("--use_lora", type=bool, default=True, help="use LoRA for fine-tuning")
     parser.add_argument("--use_reslr", type=bool, default=True, help="use residual lora for fine-tuning")
 
-    parser.add_argument("--initial-lambda-active", type=float, default=0.01, help="initial lambda_active value")
-    parser.add_argument("--initial-lambda-distill", type=float, default=0.1, help="initial lambda_distill value")
-    parser.add_argument("--lambda-router-entropy", type=float, default=0.0001, help="weight for router entropy regularization (to prevent routing collapse)")
+    parser.add_argument("--initial-lambda-active", type=float, default=0.0001, help="initial lambda_active value")
+    parser.add_argument("--initial-lambda-distill", type=float, default=1, help="initial lambda_distill value")
+    parser.add_argument("--initial-lambda-class", type=float, default=10, help="initial lambda_class value")
+    parser.add_argument("--lambda-router-entropy", type=float, default=0.001, help="weight for router entropy regularization (to prevent routing collapse)")
     
     # Dynamic target scheduling
     parser.add_argument("--use-cosine-target-schedule", type=bool, default=False, 
                         help="use cosine annealing schedule for dynamic_active_target (from 1.0 to target)")
+    parser.add_argument("--dynamic_active_target", type=float, default=0.6, 
+                    help="final dynamic active target ratio (when use_cosine_target_schedule=True, will decay from 1.0 to this value)")
 
     parser.add_argument("--n_heads", type=int, default=12, help="number of heads")
     parser.add_argument("--n_kv_heads", type=int, default=12, help="number of kv heads")
     parser.add_argument("--norm_eps", type=float, default=1e-5, help="normalization epsilon")
     parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--dynamic_active_target", type=float, default=0.6, 
-                        help="final dynamic active target ratio (when use_cosine_target_schedule=True, will decay from 1.0 to this value)")
     parser.add_argument("--dynamic_start_layer", type=int, default=2, help="layer index to start dynamic routing")
     parser.add_argument("--dynamic_router_hdim", type=int, default=512, help="hidden dimension for dynamic router")
-    parser.add_argument("--dynamic_reserve_initials", type=int, default=1, help="number of initial layers to reserve")
+    parser.add_argument("--dynamic_reserve_initials", type=int, default=1, help="number of initial tokens to reserve")
     parser.add_argument("--low_rank_dim", type=int, default=256, help="low-rank dimension for compression")
-    parser.add_argument("--block_size", type=int, default=2, help="block size for grouping (minimum 2)")
+    parser.add_argument("--block_size", type=int, default=1, help="block size for grouping (minimum 2)")
 
     config = parser.parse_args()
 

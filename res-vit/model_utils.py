@@ -22,6 +22,10 @@ def _gen_LRA_mask(block_size: int):
         LRA_mask.append((layer_for_lora, layer_for_transformer, layer_for_ste))
     return LRA_mask
 
+mapping_table_1 = [
+    [[0],      # 0
+    []]
+]
 
 mapping_table_2 = [
     [
@@ -65,7 +69,9 @@ mapping_table_4 = [
 def get_indices_from_LRA_mask(block_size, mapping_table=None):
 
     if mapping_table is None:
-        if block_size == 2:
+        if block_size == 1:
+            mapping_table = mapping_table_1
+        elif block_size == 2:
             mapping_table = mapping_table_2
         elif block_size == 4:
             mapping_table = mapping_table_4
