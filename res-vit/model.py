@@ -184,9 +184,13 @@ class RouterModule(nn.Module):
         self.linear_2 = nn.Linear(hidden_dim, block_size * 2)
         self.block_size = block_size
         
+        # 初始化权重
+        nn.init.normal_(self.linear_1.weight, mean=0, std=0.01)
+        nn.init.normal_(self.linear_2.weight, mean=0, std=0.01)
+        
         for i in range(block_size):  # 0 means pass, 1 means keep ; so change bias
             self.linear_2.bias.data[i*2] = 0.1      
-            self.linear_2.bias.data[i*2+1] = 2.0    
+            self.linear_2.bias.data[i*2+1] = 5.0    
         
         self.reserve_initials = reserve_initials
 
@@ -554,7 +558,7 @@ class Transformer(nn.Module):
         # pos_embedding
         x = self.pos_embedding(x)
 
-        acts = []
+        self.acts = []
         d_loss = torch.tensor(0.0, device=x.device)
         r_entropy = torch.tensor(0.0, device=x.device)  # 累积 router entropy
         block_info = {}
@@ -578,12 +582,12 @@ class Transformer(nn.Module):
                 output = layer(x, block_info)
                 x, w, block_info = output
                 
-            acts.append(w)
+            self.acts.append(w)
         
         # norm
         x = self.norm(x)
 
-        activation = torch.cat(acts, dim=-1)
+        activation = torch.cat(self.acts, dim=-1)
 
         output = self.classifier(x[:,0])
         self.logits = output

@@ -8,7 +8,7 @@ from utils import *
 from transformers import get_cosine_schedule_with_warmup
 
 
-def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, lambda_active=10.0, lambda_distill=1.0, lambda_router_entropy=0.01, device=torch.device('cpu'), total_steps=15000):
+def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), total_steps=15000):
     metrics.reset()
     if metrics.writer is not None:
         metrics.writer.set_step(epoch * len(data_loader), mode='train')
@@ -28,12 +28,25 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
 
         c_loss, a_loss, d_loss, r_entropy, active_metric = model(batch_data, batch_target)
         
+        # 记录每个layer的激活率到swanlab
+        if metrics.writer is not None and metrics.writer.enabled:
+            layer_activations = {}
+            # 假设acts列表存储了每个layer的激活率w
+            for i, w in enumerate(model.acts if hasattr(model, 'acts') else []):
+                # 计算当前layer的平均激活率
+                avg_activation = w.mean().item()
+                layer_activations[f'layer_{i}'] = avg_activation
+            
+            # 使用add_scalars记录所有layer的激活率到一个表中
+            if layer_activations:
+                metrics.writer.add_scalars('layer_activation_rates', layer_activations)
+        
         if model.use_reslr:
             # total_loss = c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
             # 注意：负号表示最大化熵，防止塔陷
-            total_loss = 1 * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
+            total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
         else:
-            total_loss = c_loss
+            total_loss = lambda_class * c_loss
             a_loss = torch.tensor(0.0)
             d_loss = torch.tensor(0.0)
             r_entropy = torch.tensor(0.0)
@@ -79,13 +92,13 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
                 f"Train Epoch: {epoch:03d} Batch: {batch_idx:05d}/{len(data_loader):05d} Acc@1: {acc1.item():.2f}, Acc@5: {acc5.item():.2f} "
                 f"Loss: {total_loss.item():.4f} C_Loss: {c_loss.item():.4f} A_Loss: {a_loss.item():.4f} D_Loss: {d_loss.item():.4f} "
                 f"ActiveRatio: {active_ratio:.2f} CurrentTarget: {current_target:.4f} RouterEntropy: {router_entropy:.4f} "
-                f"LambdaActive: {lambda_active:.2f} LambdaDistill: {lambda_distill:.2f} LambdaEntropy: {lambda_router_entropy:.4f}"
+                f"LA: {lambda_active:.3f} LD: {lambda_distill:.3f} LC: {lambda_class:.3f} LE: {lambda_router_entropy:.4f}"
             )
 
     return metrics.result()
 
 
-def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_router_entropy=0.01, device=torch.device('cpu')):
+def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu')):
     metrics.reset()
     losses = []
     c_losses = []
@@ -110,9 +123,9 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
             c_loss, a_loss, d_loss, r_entropy, active_metric = model(batch_data, batch_target)
             
             if model.use_reslr:
-                total_loss = c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
+                total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
             else:
-                total_loss = c_loss
+                total_loss = lambda_class * c_loss
                 a_loss = torch.tensor(0.0)  # 设置为0以便显示
                 d_loss = torch.tensor(0.0)  # 设置为0以便显示
                 r_entropy = torch.tensor(0.0)
@@ -183,7 +196,7 @@ def main():
     print_config(config)
 
     # metric tracker
-    metric_names = ['loss', 'c_loss', 'a_loss', 'd_loss', 'router_entropy', 'acc1', 'acc5', 'active_ratio', 'lr', 'current_target']
+    metric_names = ['loss', 'c_loss', 'a_loss', 'd_loss', 'router_entropy', 'acc1', 'acc5', 'active_ratio', 'lr', 'current_target',]
     train_metrics = MetricTracker(*[metric for metric in metric_names], writer=writer)
     valid_metrics = MetricTracker(*[metric for metric in metric_names], writer=writer)
 
@@ -249,20 +262,20 @@ def main():
     # start training
     print("start training")
     best_acc = 0.0
-    lambda_active, lambda_distill = config.initial_lambda_active, config.initial_lambda_distill
+    lambda_active, lambda_distill, lambda_class = config.initial_lambda_active, config.initial_lambda_distill, config.initial_lambda_class
     lambda_router_entropy = config.lambda_router_entropy
     
     
     print(f"Training for {epochs} epochs based on {config.train_steps} steps")
     for epoch in range(epochs):  # 从0开始，到epochs-1结束
         log = {'epoch': epoch}
-        log.update({'lambda_active': lambda_active, 'lambda_distill': lambda_distill, 'lambda_router_entropy': lambda_router_entropy})
+        log.update({'lambda_active': lambda_active, 'lambda_distill': lambda_distill, 'lambda_class': lambda_class, 'lambda_router_entropy': lambda_router_entropy})
 
         # train the model
         model.train()
         result = train_epoch(epoch, model, train_dataloader, optimizer, train_metrics, config, 
                             lr_scheduler if config.lr_scheduler == 'cosine_with_warmup' else None,
-                            lambda_active, lambda_distill, lambda_router_entropy, device, total_steps=config.train_steps)
+                            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device, total_steps=config.train_steps)
         log.update(result)
         
         if config.lr_scheduler == 'cosine':
@@ -271,7 +284,7 @@ def main():
         # validate the model
         model.eval()
         result = valid_epoch(epoch, model, valid_dataloader, optimizer, valid_metrics, 
-                          lambda_active, lambda_distill, lambda_router_entropy, device)
+                          lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device)
         log.update(**{'val_' + k: v for k, v in result.items()})
         
         # best acc
