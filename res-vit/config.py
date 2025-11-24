@@ -132,12 +132,13 @@ def get_train_config():
     # basic config
     parser.add_argument("--exp-name", type=str, default="reslr", help="experiment name")
     parser.add_argument("--swanlab", default=True, action='store_true', help='flag of turning on swanlab')
+    parser.add_argument("--swanlab-flag", type=str, default="vit-imagenet", help='name of the experiment if swanlab is turned on')
     parser.add_argument("--model-arch", type=str, default="b16", help='model setting to use', choices=['b16', 'b32', 'l16', 'l32', 'h14'])
     parser.add_argument("--checkpoint-path", type=str, default="../weights/pytorch/imagenet21k+imagenet2012_ViT-B_16-224.pth", help="model checkpoint to load weights")
     parser.add_argument("--image-size", type=int, default=224, help="input image size", choices=[224, 384])
     parser.add_argument("--num-workers", type=int, default=1, help="number of workers")
     parser.add_argument("--data-dir", type=str, default='../data/', help='data folder')
-    parser.add_argument("--dataset", type=str, default='CIFAR100', help="dataset for fine-tunning/evaluation", 
+    parser.add_argument("--dataset", type=str, default='ImageNet', help="dataset for fine-tunning/evaluation", 
                                                choices=['CIFAR10', 'CIFAR100', 'ImageNet', 'TinyImageNet'])
     parser.add_argument("--num-classes", type=int, default=1000, help="number of classes in dataset")
     parser.add_argument("--patch-size", type=int, default=16, help="patch size")
@@ -146,8 +147,8 @@ def get_train_config():
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")  # 降低学习率，更适合AdamW
     parser.add_argument("--wd", type=float, default=0.05, help="weight decay")  # 增加权重衰减，更适合ViT和AdamW
-    parser.add_argument("--train-steps", type=int, default=15000, help="number of training/fine-tunning steps")
-    parser.add_argument("--warmup-steps", type=int, default=500, help="learning rate warm up steps")
+    parser.add_argument("--train-steps", type=int, default=150000, help="number of training/fine-tunning steps")
+    parser.add_argument("--warmup-steps", type=int, default=5000, help="learning rate warm up steps")
     parser.add_argument("--print-freq", type=int, default=100, help="print frequency")
     parser.add_argument("--device", type=str, default='cuda:2', help="device to use for training")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")

@@ -93,8 +93,8 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
             print(
                 f"Train Epoch: {epoch:03d} Batch: {batch_idx:05d}/{len(data_loader):05d} Acc@1: {acc1.item():.2f}, Acc@5: {acc5.item():.2f} "
                 f"Loss: {total_loss.item():.4f} C_Loss: {c_loss.item():.4f} A_Loss: {a_loss.item():.4f} D_Loss: {d_loss.item():.4f} "
-                f"ActiveRatio: {active_ratio:.2f} CurrentTarget: {current_target:.4f} RouterEntropy: {router_entropy:.4f} "
-                f"LA: {lambda_active:.3f} LD: {lambda_distill:.3f} LC: {lambda_class:.3f} LE: {lambda_router_entropy:.4f}"
+                f"ActiveRatio: {active_ratio:.2f} CurrentTarget: {current_target:.2f} RouterEntropy: {router_entropy:.4f} "
+                f"LA: {lambda_active:.1e} LD: {lambda_distill:.1e} LC: {lambda_class:.1e} LE: {lambda_router_entropy:.1e}"
             )
 
     return metrics.result()
@@ -194,7 +194,7 @@ def main():
     seed = config.seed if hasattr(config, 'seed') else 42
 
     # swanlab
-    writer = SwanLabWriter(config.summary_dir, config.swanlab)
+    writer = SwanLabWriter(config.summary_dir, config.swanlab, config.swanlab_flag)
     print_config(config)
 
     # metric tracker

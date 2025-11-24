@@ -87,7 +87,7 @@ class MetricTracker:
         return dict(self._data.average)
 
 class SwanLabWriter:
-    def __init__(self, log_dir, enabled=True):
+    def __init__(self, log_dir, enabled=True, project_name=None):
         self.enabled = enabled
         self.step = 0
         self.mode = ''
@@ -98,7 +98,7 @@ class SwanLabWriter:
         else:
             import swanlab
             self.swanlab = swanlab
-            self.swanlab.init(project="vision-transformer", config={"log_dir": log_dir})
+            self.swanlab.init(project=project_name, config={"log_dir": log_dir})
 
     def set_step(self, step, mode='train'):
         """设置当前步骤和模式"""
