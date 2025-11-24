@@ -56,6 +56,8 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
             }
         
         total_loss.backward()
+        if config.clip_grad_norm:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2)
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()

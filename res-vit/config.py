@@ -160,6 +160,7 @@ def get_train_config():
     # Cosine scheduler hyperparameters
     parser.add_argument("--lr-scheduler", type=str, default="cosine_with_warmup", help="learning rate scheduler", choices=["cosine", "cosine_with_warmup"])
     parser.add_argument("--min-lr", type=float, default=1e-6, help="minimum learning rate")
+    parser.add_argument("--clip-grad-norm", type=bool, default=True, help="clip gradient norm")
     
     # Dynamic weight adjustment parameters
     parser.add_argument("--use_lora", type=bool, default=True, help="use LoRA for fine-tuning")
