@@ -1,7 +1,6 @@
 import argparse
 from utils import process_config
 
-
 def set_model_architecture(model_args, model_arch):
     """
     Set model architecture parameters based on model_arch choice
@@ -46,7 +45,6 @@ def set_model_architecture(model_args, model_arch):
     
     return model_args
 
-
 def get_num_classes_for_dataset(dataset_name):
     """
     根据数据集名称自动获取类别数量
@@ -66,7 +64,6 @@ def get_num_classes_for_dataset(dataset_name):
     
     # 返回对应数据集的类别数，如果找不到则返回默认值1000
     return dataset_classes.get(dataset_name, 1000)
-
 
 def config_to_model_args(ModelArgs,config):
     """
@@ -109,7 +106,6 @@ def get_eval_config():
     parser.add_argument("--num-workers", type=int, default=1, help="number of workers")
     parser.add_argument("--data-dir", type=str, default='../data/', help='data folder')
     parser.add_argument("--dataset", type=str, default='ImageNet', help="dataset for evaluation", choices=['CIFAR10', 'CIFAR100', 'ImageNet', 'TinyImageNet'])
-    parser.add_argument("--num-classes", type=int, default=1000, help="number of classes in dataset")
     parser.add_argument("--patch-size", type=int, default=16, help="patch size")
     
     # Evaluation hyperparameters
@@ -120,11 +116,9 @@ def get_eval_config():
 
     config = parser.parse_args()
 
-    if config.num_classes == 1000:
-        config.num_classes = get_num_classes_for_dataset(config.dataset)
+    config.num_classes = get_num_classes_for_dataset(config.dataset)
 
     return config
-
 
 def get_train_config():
     parser = argparse.ArgumentParser("Visual Transformer Train/Fine-tune")
@@ -132,28 +126,26 @@ def get_train_config():
     # basic config
     parser.add_argument("--exp-name", type=str, default="reslr", help="experiment name")
     parser.add_argument("--swanlab", default=True, action='store_true', help='flag of turning on swanlab')
-    parser.add_argument("--swanlab-flag", type=str, default="vit-imagenet", help='name of the experiment if swanlab is turned on')
     parser.add_argument("--model-arch", type=str, default="b16", help='model setting to use', choices=['b16', 'b32', 'l16', 'l32', 'h14'])
     parser.add_argument("--checkpoint-path", type=str, default="../weights/pytorch/imagenet21k+imagenet2012_ViT-B_16-224.pth", help="model checkpoint to load weights")
     parser.add_argument("--image-size", type=int, default=224, help="input image size", choices=[224, 384])
     parser.add_argument("--num-workers", type=int, default=1, help="number of workers")
     parser.add_argument("--data-dir", type=str, default='../data/', help='data folder')
-    parser.add_argument("--dataset", type=str, default='ImageNet', help="dataset for fine-tunning/evaluation", 
+    parser.add_argument("--dataset", type=str, default='CIFAR100', help="dataset for fine-tunning/evaluation", 
                                                choices=['CIFAR10', 'CIFAR100', 'ImageNet', 'TinyImageNet'])
-    parser.add_argument("--num-classes", type=int, default=1000, help="number of classes in dataset")
     parser.add_argument("--patch-size", type=int, default=16, help="patch size")
     
     # Training hyperparameters
     parser.add_argument("--batch-size", type=int, default=32, help="batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")  # 降低学习率，更适合AdamW
-    parser.add_argument("--wd", type=float, default=0.05, help="weight decay")  # 增加权重衰减，更适合ViT和AdamW
-    parser.add_argument("--train-steps", type=int, default=150000, help="number of training/fine-tunning steps")
-    parser.add_argument("--warmup-steps", type=int, default=5000, help="learning rate warm up steps")
+    parser.add_argument("--train-steps", type=int, default=15000, help="number of training/fine-tunning steps")
+    parser.add_argument("--warmup-steps", type=int, default=500, help="learning rate warm up steps")
     parser.add_argument("--print-freq", type=int, default=100, help="print frequency")
     parser.add_argument("--device", type=str, default='cuda:2', help="device to use for training")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
 
     # AdamW optimizer hyperparameters
+    parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
+    parser.add_argument("--wd", type=float, default=0.05, help="weight decay")
     parser.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1 parameter")
     parser.add_argument("--beta2", type=float, default=0.999, help="AdamW beta2 parameter")
     parser.add_argument("--eps", type=float, default=1e-8, help="AdamW epsilon parameter")
@@ -166,11 +158,10 @@ def get_train_config():
     # Dynamic weight adjustment parameters
     parser.add_argument("--use_lora", type=bool, default=True, help="use LoRA for fine-tuning")
     parser.add_argument("--use_reslr", type=bool, default=True, help="use residual lora for fine-tuning")
-
     parser.add_argument("--initial-lambda-active", type=float, default=0.0001, help="initial lambda_active value")
-    parser.add_argument("--initial-lambda-distill", type=float, default=1, help="initial lambda_distill value")
-    parser.add_argument("--initial-lambda-class", type=float, default=10, help="initial lambda_class value")
-    parser.add_argument("--lambda-router-entropy", type=float, default=0.001, help="weight for router entropy regularization (to prevent routing collapse)")
+    parser.add_argument("--initial-lambda-distill", type=float, default=0.01, help="initial lambda_distill value")
+    parser.add_argument("--initial-lambda-class", type=float, default=1, help="initial lambda_class value")
+    parser.add_argument("--initial-lambda-router-entropy", type=float, default=0, help="weight for router entropy regularization (to prevent routing collapse)")
     
     # Dynamic target scheduling
     parser.add_argument("--use-cosine-target-schedule", type=bool, default=False, 
@@ -186,12 +177,12 @@ def get_train_config():
     parser.add_argument("--dynamic_router_hdim", type=int, default=512, help="hidden dimension for dynamic router")
     parser.add_argument("--dynamic_reserve_initials", type=int, default=1, help="number of initial tokens to reserve")
     parser.add_argument("--low_rank_dim", type=int, default=256, help="low-rank dimension for compression")
-    parser.add_argument("--block_size", type=int, default=1, help="block size for grouping (minimum 2)")
+    parser.add_argument("--block_size", type=int, default=1, help="block size for grouping (1 2 4)") 
 
     config = parser.parse_args()
 
-    if config.num_classes == 1000:
-        config.num_classes = get_num_classes_for_dataset(config.dataset)
+    config.num_classes = get_num_classes_for_dataset(config.dataset)
+    config.swanlab_flag = "vit-" + config.dataset
 
     # model config
     process_config(config)

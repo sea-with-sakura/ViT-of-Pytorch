@@ -465,9 +465,10 @@ class TransformerBlock(nn.Module):
         # attention_output
         assert LRA_mask is not None, "LRA_mask must be provided"  # LRA_mask is not None, assert statement
         LRA_mask_lora = torch.tensor(LRA_mask[self.current_block_pos][0], device=x.device)
+        lora_mask_indices = torch.isin(router_indices.long(), LRA_mask_lora.long()) # [bsz, seqlen, 1 ]
         LRA_mask_transformer = torch.tensor(LRA_mask[self.current_block_pos][1], device=x.device)
-
         attention_mask_indices = torch.isin(router_indices.long(), LRA_mask_transformer.long()) # [bsz, seqlen, 1 ]
+
         h = x + self.attention(self.attention_norm(x), attention_mask_indices)
         output = h + self.feed_forward(self.ffn_norm(h))
 
@@ -477,7 +478,7 @@ class TransformerBlock(nn.Module):
         # attention_output + ste_output + low_rank_out
         full_output =  block_path_approximators(full_output, router_indices, LRA_mask_lora)
 
-        return output, full_output, w, block_info
+        return output, full_output, w, block_info, lora_mask_indices
 
 
 class Transformer(nn.Module):
@@ -566,9 +567,8 @@ class Transformer(nn.Module):
         for layer in self.layers:
             # reslr
             if self.use_reslr and layer.layer_id >= layer.dynamic_start_layer:  # pyright: ignore[reportOperatorIssue]
-                output, full_output, w, block_info = layer(x, block_info, self.LRA_mask)
-                mask_inactive = 1.0 - w
-                layer_d_loss = self.criterion_distill(full_output, output, mask_inactive)
+                output, full_output, w, block_info, lora_mask_indices = layer(x, block_info, self.LRA_mask)
+                layer_d_loss = self.criterion_distill(full_output, output, lora_mask_indices)
                 d_loss += layer_d_loss
                 
                 # 累积 router entropy（只在block head层有值）

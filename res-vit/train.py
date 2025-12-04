@@ -73,7 +73,6 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
         metrics.update('router_entropy', r_entropy.item() if isinstance(r_entropy, torch.Tensor) else r_entropy)
         metrics.update('acc1', acc1.item())
         metrics.update('acc5', acc5.item())
-        # active_metric['non_low_rank_ratio']现在是标量，不需要mean()
         active_ratio_value = active_metric['non_low_rank_ratio']
         if isinstance(active_ratio_value, torch.Tensor):
             active_ratio_value = active_ratio_value.item()
@@ -111,6 +110,7 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
     acc5s = []
     active_ratios = []
     current_targets = []
+    layer_activations_all = {}  # 收集所有batch的layer激活率
     
     # 设置writer模式为'val'
     if metrics.writer is not None:
@@ -123,6 +123,14 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
             batch_target = batch_target.to(device)
 
             c_loss, a_loss, d_loss, r_entropy, active_metric = model(batch_data, batch_target)
+            
+            # 收集每个layer的激活率
+            for i, w in enumerate(model.acts if hasattr(model, 'acts') else []):
+                avg_activation = w.mean().item()
+                layer_key = f'layer_{i}'
+                if layer_key not in layer_activations_all:
+                    layer_activations_all[layer_key] = []
+                layer_activations_all[layer_key].append(avg_activation)
             
             if model.use_reslr:
                 total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
@@ -181,6 +189,14 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
     metrics.update('active_ratio', active_ratio)
     metrics.update('lr', optimizer.param_groups[0]['lr'])
     metrics.update('current_target', current_target)
+    
+    # 记录每个layer的平均激活率到swanlab
+    if metrics.writer is not None and metrics.writer.enabled:
+        layer_activations_avg = {}
+        for layer_key, activations in layer_activations_all.items():
+            layer_activations_avg[layer_key] = np.mean(activations)
+        if layer_activations_avg:
+            metrics.writer.add_scalars('layer_activation_rates', layer_activations_avg)
     
     return metrics.result()
 
@@ -265,7 +281,7 @@ def main():
     print("start training")
     best_acc = 0.0
     lambda_active, lambda_distill, lambda_class = config.initial_lambda_active, config.initial_lambda_distill, config.initial_lambda_class
-    lambda_router_entropy = config.lambda_router_entropy
+    lambda_router_entropy = config.initial_lambda_router_entropy
     
     
     print(f"Training for {epochs} epochs based on {config.train_steps} steps")
