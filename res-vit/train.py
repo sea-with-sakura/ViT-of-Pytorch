@@ -8,10 +8,14 @@ from utils import *
 from transformers import get_cosine_schedule_with_warmup
 
 
-def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), total_steps=15000):
+def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), total_steps=15000, save_routing_viz=False):
     metrics.reset()
     if metrics.writer is not None:
         metrics.writer.set_step(epoch * len(data_loader), mode='train')
+
+    # 用于存储第一个batch的数据和路由值（用于可视化）
+    first_batch_data = None
+    first_batch_routing_maps = None
 
     # training loop
     for batch_idx, (batch_data, batch_target) in enumerate(data_loader):
@@ -27,6 +31,12 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
         optimizer.zero_grad()
 
         c_loss, a_loss, d_loss, r_entropy, active_metric = model(batch_data, batch_target)
+        
+        # 记录第一个batch的数据和路由值（用于可视化）
+        if save_routing_viz and batch_idx == 0:
+            first_batch_data = batch_data.detach().clone()
+            if hasattr(model, 'routing_maps') and model.routing_maps:
+                first_batch_routing_maps = {k: v.detach().clone() for k, v in model.routing_maps.items()}
         
         # 记录每个layer的激活率到swanlab
         if metrics.writer is not None and metrics.writer.enabled:
@@ -96,10 +106,10 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
                 f"LA: {lambda_active:.1e} LD: {lambda_distill:.1e} LC: {lambda_class:.1e} LE: {lambda_router_entropy:.1e}"
             )
 
-    return metrics.result()
+    return metrics.result(), first_batch_data, first_batch_routing_maps
 
 
-def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu')):
+def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), save_routing_viz=False):
     metrics.reset()
     losses = []
     c_losses = []
@@ -112,6 +122,10 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
     current_targets = []
     layer_activations_all = {}  # 收集所有batch的layer激活率
     
+    # 用于存储第一个batch的数据和路由值（用于可视化）
+    first_batch_data = None
+    first_batch_routing_maps = None
+    
     # 设置writer模式为'val'
     if metrics.writer is not None:
         metrics.writer.set_step(epoch, mode='valid')
@@ -123,6 +137,12 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
             batch_target = batch_target.to(device)
 
             c_loss, a_loss, d_loss, r_entropy, active_metric = model(batch_data, batch_target)
+            
+            # 记录第一个batch的数据和路由值（用于可视化）
+            if save_routing_viz and batch_idx == 0:
+                first_batch_data = batch_data.detach().clone()
+                if hasattr(model, 'routing_maps') and model.routing_maps:
+                    first_batch_routing_maps = {k: v.detach().clone() for k, v in model.routing_maps.items()}
             
             # 收集每个layer的激活率
             for i, w in enumerate(model.acts if hasattr(model, 'acts') else []):
@@ -198,7 +218,7 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
         if layer_activations_avg:
             metrics.writer.add_scalars('layer_activation_rates', layer_activations_avg)
     
-    return metrics.result()
+    return metrics.result(), first_batch_data, first_batch_routing_maps
 
 
 def main():
@@ -291,19 +311,34 @@ def main():
 
         # train the model
         model.train()
-        result = train_epoch(epoch, model, train_dataloader, optimizer, train_metrics, config, 
-                            lr_scheduler if config.lr_scheduler == 'cosine_with_warmup' else None,
-                            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device, total_steps=config.train_steps)
+        result, first_batch_data, first_batch_routing_maps = train_epoch(
+            epoch, model, train_dataloader, optimizer, train_metrics, config, 
+            lr_scheduler if config.lr_scheduler == 'cosine_with_warmup' else None,
+            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device, 
+            total_steps=config.train_steps,
+            save_routing_viz=getattr(config, 'save_routing_viz', False)
+        )
         log.update(result)
+        
+        # 保存训练路由可视化图像
+        if getattr(config, 'save_routing_viz', False) and first_batch_data is not None and first_batch_routing_maps is not None:
+            save_routing_visualization(epoch, first_batch_data, first_batch_routing_maps, config, mode='train')
         
         if config.lr_scheduler == 'cosine':
             lr_scheduler.step()
 
         # validate the model
         model.eval()
-        result = valid_epoch(epoch, model, valid_dataloader, optimizer, valid_metrics, 
-                          lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device)
+        result, val_first_batch_data, val_first_batch_routing_maps = valid_epoch(
+            epoch, model, valid_dataloader, optimizer, valid_metrics, 
+            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device,
+            save_routing_viz=getattr(config, 'save_routing_viz', False)
+        )
         log.update(**{'val_' + k: v for k, v in result.items()})
+        
+        # 保存验证路由可视化图像
+        if getattr(config, 'save_routing_viz', False) and val_first_batch_data is not None and val_first_batch_routing_maps is not None:
+            save_routing_visualization(epoch, val_first_batch_data, val_first_batch_routing_maps, config, mode='val')
         
         # best acc
         best = False

@@ -140,7 +140,7 @@ def get_train_config():
     parser.add_argument("--train-steps", type=int, default=15000, help="number of training/fine-tunning steps")
     parser.add_argument("--warmup-steps", type=int, default=500, help="learning rate warm up steps")
     parser.add_argument("--print-freq", type=int, default=100, help="print frequency")
-    parser.add_argument("--device", type=str, default='cuda:2', help="device to use for training")
+    parser.add_argument("--device", type=str, default='cuda:3', help="device to use for training")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
 
     # AdamW optimizer hyperparameters
@@ -178,6 +178,9 @@ def get_train_config():
     parser.add_argument("--dynamic_reserve_initials", type=int, default=1, help="number of initial tokens to reserve")
     parser.add_argument("--low_rank_dim", type=int, default=256, help="low-rank dimension for compression")
     parser.add_argument("--block_size", type=int, default=1, help="block size for grouping (1 2 4)") 
+    
+    # Visualization settings
+    parser.add_argument("--save-routing-viz", default=True, type=bool, help="save routing visualization images for each epoch")
 
     config = parser.parse_args()
 

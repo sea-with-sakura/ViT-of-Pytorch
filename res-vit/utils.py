@@ -2,10 +2,12 @@ import os
 import json
 import pandas as pd
 import torch
+import numpy as np
 from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime
 import gc
+from PIL import Image
 
 def ensure_dir(dirname):
     dirname = Path(dirname)
@@ -579,3 +581,96 @@ def print_config(config):
         message += '{:>35}: {:<30}{}\n'.format(str(k), str(v), comment)
     message += '----------------- End -------------------'
     print(message)
+
+
+def save_routing_visualization(epoch, batch_data, routing_maps, config, mode='train', patch_size=14):
+    """
+    保存路由可视化图像
+    
+    Args:
+        epoch: 当前epoch编号
+        batch_data: 原始输入图像batch [batch, channels, height, width]
+        routing_maps: 字典，包含每个block-head的路由值 {block_id: [batch, seq_len, block_size]}
+        config: 配置对象，包含summary_dir等路径信息
+        mode: 'train' 或 'val'，用于区分训练和验证的可视化
+        patch_size: patch的边长，默认14（对应14x14=196个tokens）
+    """
+    # 创建mode/epoch子文件夹
+    epoch_dir = os.path.join(config.summary_dir, mode, f'epoch-{epoch}')
+    ensure_dir(epoch_dir)
+    
+    # 获取第0张原始图片并保存
+    original_img = batch_data[0]  # [channels, height, width]
+    
+    # 反归一化（假设使用ImageNet标准化）
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(original_img.device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(original_img.device)
+    original_img = original_img * std + mean
+    original_img = torch.clamp(original_img, 0, 1)
+    
+    # 转换为PIL图像并保存
+    original_img_np = (original_img.cpu().numpy() * 255).astype(np.uint8)
+    original_img_np = np.transpose(original_img_np, (1, 2, 0))  # [H, W, C]
+    original_pil = Image.fromarray(original_img_np)
+    original_pil.save(os.path.join(epoch_dir, 'original_image.png'))
+    
+    # 为每个block-head生成路由可视化图
+    for block_id, routing in routing_maps.items():
+        # routing形状: [batch, seq_len, block_size]
+        # 取第0个样本
+        routing_sample = routing[0]  # [seq_len, block_size]
+        
+        # 对于每个block_size位置，生成一张图
+        block_size = routing_sample.shape[-1]
+        for pos in range(block_size):
+            # 获取当前位置的路由决策
+            routing_pos = routing_sample[:, pos]  # [seq_len]
+            
+            # 排除CLS token (第0个token)
+            routing_pos = routing_pos[1:]  # [196] 只取patch tokens
+            
+            # 将196个token还原到14x14网格
+            routing_grid = routing_pos.view(patch_size, patch_size).cpu().numpy()
+            
+            # 创建可视化图像
+            # 在原图上叠加路由决策
+            viz_img = original_img_np.copy().astype(np.float32)
+            
+            # 计算每个patch对应的像素区域
+            h, w = original_img_np.shape[:2]
+            patch_h = h // patch_size
+            patch_w = w // patch_size
+            
+            # 创建overlay层
+            overlay = np.zeros_like(viz_img)
+            alpha_mask = np.zeros((h, w), dtype=np.float32)
+            
+            for i in range(patch_size):
+                for j in range(patch_size):
+                    y_start = i * patch_h
+                    y_end = (i + 1) * patch_h if i < patch_size - 1 else h
+                    x_start = j * patch_w
+                    x_end = (j + 1) * patch_w if j < patch_size - 1 else w
+                    
+                    route_value = routing_grid[i, j]
+                    
+
+                    if route_value == 0:  # 低秩路径 - 绿色
+                        overlay[y_start:y_end, x_start:x_end] = [0, 255, 0]
+                        alpha_mask[y_start:y_end, x_start:x_end] = 0.3
+                    else:  # 完整路径 - 灰色
+                        overlay[y_start:y_end, x_start:x_end] = [128, 128, 128]
+                        alpha_mask[y_start:y_end, x_start:x_end] = 0.5
+            
+            # 混合原图和overlay
+            alpha_mask = alpha_mask[:, :, np.newaxis]
+            viz_img = (1 - alpha_mask) * viz_img + alpha_mask * overlay
+            viz_img = np.clip(viz_img, 0, 255).astype(np.uint8)
+            
+            # 保存可视化图像
+            # 计算实际的layer_id
+            layer_id = config.dynamic_start_layer + block_id * config.block_size + pos
+            viz_pil = Image.fromarray(viz_img)
+            viz_pil.save(os.path.join(epoch_dir, f'routing_layer_{layer_id:02d}_block_{block_id}_pos_{pos}.png'))
+    
+    print(f"Saved {mode} routing visualization for epoch {epoch} to {epoch_dir}")

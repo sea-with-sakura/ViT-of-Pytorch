@@ -44,7 +44,7 @@ class DistillLoss(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.criterion_mse = torch.nn.MSELoss()
+        self.criterion = torch.nn.SmoothL1Loss()
 
     def forward(self, student_output, teacher_output, mask_inactive):
 
@@ -53,11 +53,18 @@ class DistillLoss(nn.Module):
         if mask_sum > 1e-6:
 
             bool_mask = mask_inactive.squeeze(-1).bool()
-            student_active = student_output[bool_mask]
-            teacher_active = teacher_output[bool_mask]
-            layer_d_loss = self.criterion_mse(student_active, teacher_active)   
+            sparse_active = student_output[bool_mask]
+            full_active = teacher_output[bool_mask]
 
-            return layer_d_loss
+            # target_for_full = sparse_active.detach() 
+            # loss_sparsity = self.criterion(full_active, target_for_full)
+
+            target_for_sparse = full_active.detach()
+            loss_commitment = self.criterion(sparse_active, target_for_sparse)
+
+            loss_alignment = loss_commitment
+            
+            return loss_alignment
         
         return torch.tensor(0.0, device=student_output.device)
 
@@ -379,8 +386,8 @@ class BlockPathApproximators(nn.Module):
             sub_mask = (router_indices_squeezed == key)  
             if sub_mask.any():
                 approximator = self.approximators[key_str]
+                x = x.clone()
                 x[sub_mask] = approximator(x[sub_mask]) + x[sub_mask]
-
         return x
 
 
@@ -437,7 +444,7 @@ class TransformerBlock(nn.Module):
         if block_info is None:
             block_info = {}
 
-        # naive vit or lora or reslr with dynamic_start_layer
+        # naive vit or lora or reslr when layerid < dynamic_start_layer
         if not self.use_reslr or self.layer_id < self.dynamic_start_layer:
             w = torch.ones((bsz, seqlen, 1), device=x.device)
             h = x + self.attention(self.attention_norm(x))
@@ -560,6 +567,7 @@ class Transformer(nn.Module):
         x = self.pos_embedding(x)
 
         self.acts = []
+        self.routing_maps = {}  # 存储每个block-head的路由值
         d_loss = torch.tensor(0.0, device=x.device)
         r_entropy = torch.tensor(0.0, device=x.device)  # 累积 router entropy
         block_info = {}
@@ -574,6 +582,8 @@ class Transformer(nn.Module):
                 # 累积 router entropy（只在block head层有值）
                 if layer.is_block_head:
                     r_entropy += block_info[f"block_{layer.current_block_id}_router_entropy"]
+                    # 收集路由值用于可视化
+                    self.routing_maps[layer.current_block_id] = block_info[f"block_{layer.current_block_id}_routing"].detach()
                 
                 x = full_output
 
