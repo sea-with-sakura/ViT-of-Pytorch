@@ -176,6 +176,10 @@ class LayerNorm(nn.Module):
     
 
 class RouterModule(nn.Module):
+    """
+    DynamicViT 风格的 Local-Global 上下文融合路由模块
+    核心改进：判断一个 Patch 是否重要，不仅看 Patch 自己，还要看它与整张图的关系
+    """
     def __init__(
         self, 
         in_dim: int,
@@ -186,20 +190,35 @@ class RouterModule(nn.Module):
         use_lora: bool = False
     ):
         super().__init__()
-        self.linear_1 = nn.Linear(in_dim, hidden_dim)
-        self.norm = LayerNorm(hidden_dim, norm_eps, use_lora=use_lora)
-        self.linear_2 = nn.Linear(hidden_dim, block_size * 2)
         self.block_size = block_size
-        
-        # 初始化权重
-        nn.init.normal_(self.linear_1.weight, mean=0, std=0.01)
-        nn.init.normal_(self.linear_2.weight, mean=0, std=0.01)
-        
-        for i in range(block_size):  # 0 means pass, 1 means keep ; so change bias
-            self.linear_2.bias.data[i*2] = 0.1      
-            self.linear_2.bias.data[i*2+1] = 5.0    
-        
         self.reserve_initials = reserve_initials
+        
+        # DynamicViT 风格的 Local-Global 融合
+        # 输入维度映射，为拼接 Global 特征做准备
+        self.in_conv = nn.Sequential(
+            LayerNorm(in_dim, norm_eps, use_lora=use_lora),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU()
+        )
+
+        # Global 特征和 Local 特征拼接后的处理层
+        # 输入是 hidden_dim (local) + hidden_dim (global) = 2 * hidden_dim
+        # 输出是 block_size * 2 (对应二分类 logits: pass/keep)
+        self.out_conv = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, block_size * 2),
+        )
+        
+        # 初始化权重 (参考 DynamicViT 的初始化)
+        # 最后一层初始化小一点，防止初始阶段梯度过大导致坍塌
+        nn.init.normal_(self.out_conv[-1].weight, mean=0, std=0.01)
+        # 初始化 bias，使得初始状态倾向于保留完整路径 (bias > 0 for index 1)
+        for i in range(block_size):
+            self.out_conv[-1].bias.data[i*2] = 0.0       # pass path
+            self.out_conv[-1].bias.data[i*2+1] = 5.0     # keep path (Full Transformer)
 
     def _router2indices(self, x):
         n = x.shape[-1]
@@ -208,39 +227,60 @@ class RouterModule(nn.Module):
         return merged
 
     def forward(self, x):
-        bsz, seqlen, _ = x.shape
-        norm_out = self.norm(self.linear_1(x))
-        silu_out = F.silu(norm_out)
+        # x shape: [Batch, SeqLen, Dim]
+        B, N, C = x.shape
         
-        logits = self.linear_2(silu_out)  # [batch, seq_len, block_size*2]
-        logits = logits.view(bsz, seqlen, self.block_size, 2)  # [batch, seq_len, block_size, 2]
+        # 1. 提取特征并降维
+        x_embed = self.in_conv(x)  # [B, N, hidden_dim]
         
-        # 计算soft概率用于熵正则化
-        soft_routing = F.softmax(logits, dim=-1)  # [batch, seq_len, block_size, 2]
+        # 2. 提取 Global Context (全局平均池化)
+        # 注意要排除 reserve_initials (如 class token)，只对 patch tokens 做平均
+        # 只对 patch 做平均更能代表图像整体纹理
+        if self.reserve_initials > 0:
+            patch_tokens = x_embed[:, self.reserve_initials:, :]  # [B, N-reserve, hidden_dim]
+            global_feat = torch.mean(patch_tokens, dim=1, keepdim=True)  # [B, 1, hidden_dim]
+        else:
+            global_feat = torch.mean(x_embed, dim=1, keepdim=True)
+
+        # 3. 扩展 Global 特征以匹配序列长度
+        global_feat = global_feat.expand(B, N, -1)  # [B, N, hidden_dim]
+        
+        # 4. Local-Global 融合 (Concatenation)
+        # 融合后的维度是 [B, N, 2 * hidden_dim]
+        fused_feat = torch.cat([x_embed, global_feat], dim=-1)
+        
+        # 5. 预测 Logits
+        logits = self.out_conv(fused_feat)  # [B, N, block_size * 2]
+        
+        # 6. Reshape 回需要的格式 [Batch, SeqLen, BlockSize, 2]
+        logits = logits.view(B, N, self.block_size, 2)
+        
+        # 计算soft概率用于熵正则化和 Ratio Loss
+        soft_routing = F.softmax(logits, dim=-1)  # [B, N, block_size, 2]
         
         # 计算router熵（排除reserved tokens）
-        # 只对非保留的token计算熵
-        routing_probs = soft_routing[:, self.reserve_initials:, :, :]  # [batch, seq_len-reserve, block_size, 2]
-        # 熵公式: -Σ p_i × log(p_i)
+        routing_probs = soft_routing[:, self.reserve_initials:, :, :]  # [B, N-reserve, block_size, 2]
         router_entropy = -torch.sum(
             routing_probs * torch.log(routing_probs + 1e-8)
-        ) / (bsz * (seqlen - self.reserve_initials) * self.block_size)  # 归一化
+        ) / (B * (N - self.reserve_initials) * self.block_size)
         
-        # 生成硬决策用于实际路由
+        # Gumbel-Softmax 生成硬决策 (Training) 或 Argmax (Inference)
         if self.training:
-            hard_routing = F.gumbel_softmax(logits, dim=-1, tau=1, hard=True)
+            hard_routing = F.gumbel_softmax(logits, tau=1, hard=True, dim=-1)
         else:
-            probs = F.softmax(logits, dim=-1)
-            hard_routing = torch.zeros_like(probs)
-            idx = probs.argmax(dim=-1, keepdim=True)  # 每个位置二选一
-            hard_routing.scatter_(-1, idx, 1)         # 生成one-hot决策，与训练阶段行为一致
+            idx = soft_routing.argmax(dim=-1, keepdim=True)
+            hard_routing = torch.zeros_like(soft_routing).scatter_(-1, idx, 1.0)
         
-        # 保留初始token始终走完整路径
-        hard_routing[:, :self.reserve_initials, :, :] = torch.tensor([0, 1]).type_as(hard_routing)
+        # 强制保留 Class Token 等始终走完整路径
+        if self.reserve_initials > 0:
+            # index 1 是 "Keep" / "Transformer Path"
+            hard_routing[:, :self.reserve_initials, :, :] = 0
+            hard_routing[:, :self.reserve_initials, :, 1] = 1
         
         indices = self._router2indices(hard_routing[:, :, :, 1])
 
-        return hard_routing, indices, router_entropy
+        # 返回 soft_routing 用于 Ratio Loss 的梯度传播
+        return hard_routing, indices, router_entropy, soft_routing
     
 class Attention(nn.Module):
     """Multi-head attention module."""
@@ -269,51 +309,60 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask_indices: Optional[torch.Tensor] = None
+        x_kv: Optional[torch.Tensor] = None
     ):
-
+        """
+        Forward pass with optional asymmetric attention.
+        
+        Args:
+            x: Query tokens [bsz, seqlen_q, dim]
+            x_kv: Key/Value tokens [bsz, seqlen_kv, dim]. If None, uses x for KV (standard self-attention)
+        """
         if len(x.shape) == 2:
             no_batch = True
             x = x.unsqueeze(0)
+            if x_kv is not None:
+                x_kv = x_kv.unsqueeze(0)
         else:
             no_batch = False
 
-        bsz, seqlen, _ = x.shape
+        bsz, seqlen_q, _ = x.shape
+        
+        # 如果没有提供x_kv，使用x作为KV（标准self-attention）
+        if x_kv is None:
+            x_kv = x
+        seqlen_kv = x_kv.shape[1]
 
         if self.use_lora:
             xq = self.wq(x) + self.lora_q(x)
-            xk = self.wk(x) + self.lora_k(x)
-            xv = self.wv(x) + self.lora_v(x)
+            xk = self.wk(x_kv) + self.lora_k(x_kv)
+            xv = self.wv(x_kv) + self.lora_v(x_kv)
         else:
             xq = self.wq(x)
-            xk = self.wk(x)
-            xv = self.wv(x)
+            xk = self.wk(x_kv)
+            xv = self.wv(x_kv)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xq = xq.view(bsz, seqlen_q, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen_kv, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen_kv, self.n_local_kv_heads, self.head_dim)
 
         keys = xk
         values = xv
 
         # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen_kv, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, seqlen_kv, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen_q, head_dim)
+        keys = keys.transpose(1, 2) # (bs, n_local_heads, seqlen_kv, head_dim)
+        values = values.transpose(1, 2) # (bs, n_local_heads, seqlen_kv, head_dim)
         
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim) # (bs, n_local_heads, seqlen, seqlen)
-
-        if attention_mask_indices is not None:
-            attention_mask_indices = rearrange(attention_mask_indices, 'bsz seqlen 1 -> bsz 1 1 seqlen') # mask key
-            scores = scores.masked_fill(~attention_mask_indices, torch.finfo(scores.dtype).min)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim) # (bs, n_local_heads, seqlen_q, seqlen_kv)
 
         scores = F.softmax(scores.float(), dim=-1)
 
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen_q, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen_q, -1)
         output = self.wo(output)
 
         if no_batch:
@@ -453,8 +502,10 @@ class TransformerBlock(nn.Module):
 
         # block_head need route and approximators
         if self.is_block_head:    
-            routing, router_indices, router_entropy = self.router(x)
-            block_routing = routing[:, :, :, 1] # [batch, seq_len, block_size]
+            routing, router_indices, router_entropy, soft_routing = self.router(x)
+            block_routing = routing[:, :, :, 1]  # [batch, seq_len, block_size]
+            # 提取软概率用于 Ratio Loss (DynamicViT 风格)
+            soft_routing_probs = soft_routing[:, :, :, 1]  # [batch, seq_len, block_size] - 保留路径的概率
 
             # block info
             block_info = {}
@@ -462,6 +513,7 @@ class TransformerBlock(nn.Module):
             block_info[f"block_{self.current_block_id}_routing"] = block_routing
             block_info[f"block_{self.current_block_id}_router_indices"] = router_indices
             block_info[f"block_{self.current_block_id}_router_entropy"] = router_entropy
+            block_info[f"block_{self.current_block_id}_soft_routing"] = soft_routing_probs  # 新增：用于 Ratio Loss
 
         # each layer need approximator or Transformer
         block_path_approximators = block_info[f"block_{self.current_block_id}_approximators"]
@@ -476,14 +528,53 @@ class TransformerBlock(nn.Module):
         LRA_mask_transformer = torch.tensor(LRA_mask[self.current_block_pos][1], device=x.device)
         attention_mask_indices = torch.isin(router_indices.long(), LRA_mask_transformer.long()) # [bsz, seqlen, 1 ]
 
-        h = x + self.attention(self.attention_norm(x), attention_mask_indices)
-        output = h + self.feed_forward(self.ffn_norm(h))
+        if self.training:
+            # 训练阶段：所有token互相可见，不使用mask
+            h = x + self.attention(self.attention_norm(x))
+            output = h + self.feed_forward(self.ffn_norm(h))
 
-        # attention_output + ste_output
-        full_output = attention_mask_indices * output + (~attention_mask_indices) * x
-    
-        # attention_output + ste_output + low_rank_out
-        full_output =  block_path_approximators(full_output, router_indices, LRA_mask_lora)
+            # attention_output + ste_output
+            full_output = attention_mask_indices * output + (~attention_mask_indices) * x
+        
+            # attention_output + ste_output + low_rank_out
+            full_output = block_path_approximators(full_output, router_indices, LRA_mask_lora)
+        else:
+            # 推理阶段：非对称attention，Q用active tokens，KV用所有tokens
+            x_normed = self.attention_norm(x)
+            
+            # 获取active tokens的索引
+            active_mask = attention_mask_indices.squeeze(-1)  # [bsz, seqlen]
+            
+            # 构建active tokens作为Q
+            # 为了保持batch维度一致，使用masked方式处理
+            bsz_local = x.shape[0]
+            active_outputs = []
+            
+            for b in range(bsz_local):
+                batch_active_mask = active_mask[b]  # [seqlen]
+                x_q = x_normed[b:b+1, batch_active_mask, :]  # [1, num_active, dim]
+                x_kv = x_normed[b:b+1]  # [1, seqlen, dim] - 所有tokens
+                
+                # 非对称attention: Q=active, KV=all
+                attn_out = self.attention(x_q, x_kv)  # [1, num_active, dim]
+                
+                # 构建完整输出，active位置用attention输出，inactive位置用原始x
+                full_attn = x[b:b+1].clone()  # [1, seqlen, dim]
+                full_attn[:, batch_active_mask, :] = x[b:b+1, batch_active_mask, :] + attn_out
+                active_outputs.append(full_attn)
+            
+            h = torch.cat(active_outputs, dim=0)  # [bsz, seqlen, dim]
+            
+            # FFN只对active tokens应用
+            h_normed = self.ffn_norm(h)
+            ffn_out = self.feed_forward(h_normed)
+            output = h + ffn_out
+            
+            # active tokens用transformer输出，inactive tokens保持原始x
+            full_output = attention_mask_indices * output + (~attention_mask_indices) * x
+            
+            # 低秩approximator处理inactive tokens
+            full_output = block_path_approximators(full_output, router_indices, LRA_mask_lora)
 
         return output, full_output, w, block_info, lora_mask_indices
 
@@ -567,6 +658,7 @@ class Transformer(nn.Module):
         x = self.pos_embedding(x)
 
         self.acts = []
+        self.soft_routing_probs = []  # 新增：收集所有层的软概率用于 Ratio Loss
         self.routing_maps = {}  # 存储每个block-head的路由值
         d_loss = torch.tensor(0.0, device=x.device)
         r_entropy = torch.tensor(0.0, device=x.device)  # 累积 router entropy
@@ -584,6 +676,9 @@ class Transformer(nn.Module):
                     r_entropy += block_info[f"block_{layer.current_block_id}_router_entropy"]
                     # 收集路由值用于可视化
                     self.routing_maps[layer.current_block_id] = block_info[f"block_{layer.current_block_id}_routing"].detach()
+                    # 新增：收集软概率用于 Ratio Loss (DynamicViT 风格)
+                    soft_prob = block_info[f"block_{layer.current_block_id}_soft_routing"]  # [B, N, block_size]
+                    self.soft_routing_probs.append(soft_prob)
                 
                 x = full_output
 
@@ -605,7 +700,15 @@ class Transformer(nn.Module):
         
         # reslr
         if self.use_reslr:
-            a_loss = self.criterion_active(activation)
+            # DynamicViT 风格：使用软概率计算 Ratio Loss，让梯度回传更顺畅
+            if len(self.soft_routing_probs) > 0:
+                # 拼接所有 block 的软概率 [B, N, total_blocks * block_size]
+                all_soft_probs = torch.cat(self.soft_routing_probs, dim=-1)
+                a_loss = self.criterion_active(all_soft_probs)
+            else:
+                a_loss = torch.tensor(0.0, device=x.device)
+            
+            # Metric 继续使用 hard activation (self.acts)
             active_metric = self.criterion_active.metric(activation)
 
         # naive vit or lora
@@ -620,6 +723,6 @@ if __name__ == '__main__':
     params = ModelArgs(device='cuda')
     model = Transformer(params).to(params.device)
     x = torch.randn(2, 3, 224, 224).to(params.device)
-    labels = torch.randint(0, params.num_classes, (2,)).to(params.device)
+    labels = torch.randint(0, params.num_classes, (2,)).to(params.device) 
     c_loss, a_loss, d_loss, r_entropy, active_metric = model(x, labels)
     print("pass!")
