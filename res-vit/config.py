@@ -92,7 +92,6 @@ def config_to_model_args(ModelArgs,config):
     model_args.use_lora = config.use_lora
     model_args.use_reslr = config.use_reslr
     model_args.num_classes = config.num_classes
-    model_args.use_cosine_target_schedule = config.use_cosine_target_schedule
     
     return model_args
 
@@ -140,7 +139,7 @@ def get_train_config():
     parser.add_argument("--train-steps", type=int, default=15000, help="number of training/fine-tunning steps")
     parser.add_argument("--warmup-steps", type=int, default=500, help="learning rate warm up steps")
     parser.add_argument("--print-freq", type=int, default=100, help="print frequency")
-    parser.add_argument("--device", type=str, default='cuda:3', help="device to use for training")
+    parser.add_argument("--device", type=str, default='cuda:1', help="device to use for training")
     parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
 
     # AdamW optimizer hyperparameters
@@ -151,7 +150,8 @@ def get_train_config():
     parser.add_argument("--eps", type=float, default=1e-8, help="AdamW epsilon parameter")
     
     # Cosine scheduler hyperparameters
-    parser.add_argument("--lr-scheduler", type=str, default="cosine_with_warmup", help="learning rate scheduler", choices=["cosine", "cosine_with_warmup"])
+    parser.add_argument("--lr-scheduler", type=str, default="cosine_with_warmup", help="learning rate scheduler", 
+                        choices=["cosine", "cosine_with_warmup"])
     parser.add_argument("--min-lr", type=float, default=1e-6, help="minimum learning rate")
     parser.add_argument("--clip-grad-norm", type=bool, default=True, help="clip gradient norm")
     
@@ -161,14 +161,9 @@ def get_train_config():
     parser.add_argument("--initial-lambda-active", type=float, default=0.0001, help="initial lambda_active value")
     parser.add_argument("--initial-lambda-distill", type=float, default=0.01, help="initial lambda_distill value")
     parser.add_argument("--initial-lambda-class", type=float, default=1, help="initial lambda_class value")
-    parser.add_argument("--initial-lambda-router-entropy", type=float, default=0, help="weight for router entropy regularization (to prevent routing collapse)")
     
-    # Dynamic target scheduling
-    parser.add_argument("--use-cosine-target-schedule", type=bool, default=False, 
-                        help="use cosine annealing schedule for dynamic_active_target (from 1.0 to target)")
-    parser.add_argument("--dynamic_active_target", type=float, default=0.6, 
-                    help="final dynamic active target ratio (when use_cosine_target_schedule=True, will decay from 1.0 to this value)")
-
+    # Activate target ratio
+    parser.add_argument("--dynamic_active_target", type=float, default=0.6, help="dynamic active target ratio")
     parser.add_argument("--n_heads", type=int, default=12, help="number of heads")
     parser.add_argument("--n_kv_heads", type=int, default=12, help="number of kv heads")
     parser.add_argument("--norm_eps", type=float, default=1e-5, help="normalization epsilon")
@@ -180,13 +175,10 @@ def get_train_config():
     parser.add_argument("--block_size", type=int, default=1, help="block size for grouping (1 2 4)") 
     
     # Visualization settings
-    parser.add_argument("--save-routing-viz", default=True, type=bool, help="save routing visualization images for each epoch")
+    parser.add_argument("--save-routing-viz", default=False, type=bool, help="save routing visualization images for each epoch")
 
     config = parser.parse_args()
-
     config.num_classes = get_num_classes_for_dataset(config.dataset)
     config.swanlab_flag = "vit-" + config.dataset
-
-    # model config
-    process_config(config)
+    config = process_config(config)
     return config

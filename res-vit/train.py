@@ -8,7 +8,9 @@ from utils import *
 from transformers import get_cosine_schedule_with_warmup
 
 
-def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), total_steps=15000, save_routing_viz=False):
+def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_scheduler=None, 
+                lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, device=torch.device('cpu'), save_routing_viz=False):
+
     metrics.reset()
     if metrics.writer is not None:
         metrics.writer.set_step(epoch * len(data_loader), mode='train')
@@ -22,11 +24,6 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
 
         batch_data = batch_data.to(device)
         batch_target = batch_target.to(device)
-
-        # 更新动态激活目标值
-        current_step = epoch * len(data_loader) + batch_idx
-        if model.use_reslr:
-            model.criterion_active.update_target(current_step, total_steps)
 
         optimizer.zero_grad()
 
@@ -52,9 +49,7 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
                 metrics.writer.add_scalars('layer_activation_rates', layer_activations)
         
         if model.use_reslr:
-            # total_loss = c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
-            # 注意：负号表示最大化熵，防止塔陷
-            total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
+            total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss
         else:
             total_loss = lambda_class * c_loss
             a_loss = torch.tensor(0.0)
@@ -103,13 +98,13 @@ def train_epoch(epoch, model, data_loader, optimizer, metrics, config, lr_schedu
                 f"Train Epoch: {epoch:03d} Batch: {batch_idx:05d}/{len(data_loader):05d} Acc@1: {acc1.item():.2f}, Acc@5: {acc5.item():.2f} "
                 f"Loss: {total_loss.item():.4f} C_Loss: {c_loss.item():.4f} A_Loss: {a_loss.item():.4f} D_Loss: {d_loss.item():.4f} "
                 f"ActiveRatio: {active_ratio:.2f} CurrentTarget: {current_target:.2f} RouterEntropy: {router_entropy:.4f} "
-                f"LA: {lambda_active:.1e} LD: {lambda_distill:.1e} LC: {lambda_class:.1e} LE: {lambda_router_entropy:.1e}"
+                f"LA: {lambda_active:.1e} LD: {lambda_distill:.1e} LC: {lambda_class:.1e}"
             )
 
     return metrics.result(), first_batch_data, first_batch_routing_maps
 
 
-def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, lambda_router_entropy=0.01, device=torch.device('cpu'), save_routing_viz=False):
+def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.0, lambda_distill=1.0, lambda_class=10.0, device=torch.device('cpu'), save_routing_viz=False):
     metrics.reset()
     losses = []
     c_losses = []
@@ -153,7 +148,7 @@ def valid_epoch(epoch, model, data_loader, optimizer, metrics, lambda_active=10.
                 layer_activations_all[layer_key].append(avg_activation)
             
             if model.use_reslr:
-                total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss - lambda_router_entropy * r_entropy
+                total_loss = lambda_class * c_loss + lambda_active * a_loss + lambda_distill * d_loss
             else:
                 total_loss = lambda_class * c_loss
                 a_loss = torch.tensor(0.0)  # 设置为0以便显示
@@ -292,30 +287,26 @@ def main():
             optimizer, 
             num_warmup_steps = config.warmup_steps, 
             num_training_steps = config.train_steps)
+    else:
+        raise ValueError(f"Unsupported lr_scheduler: {config.lr_scheduler}")
 
-    
-    # 打印初始GPU内存使用情况
-    print_gpu_memory_usage(model, optimizer, device=device, stage="Initial")
-    
     # start training
     print("start training")
     best_acc = 0.0
     lambda_active, lambda_distill, lambda_class = config.initial_lambda_active, config.initial_lambda_distill, config.initial_lambda_class
-    lambda_router_entropy = config.initial_lambda_router_entropy
     
     
     print(f"Training for {epochs} epochs based on {config.train_steps} steps")
     for epoch in range(epochs):  # 从0开始，到epochs-1结束
         log = {'epoch': epoch}
-        log.update({'lambda_active': lambda_active, 'lambda_distill': lambda_distill, 'lambda_class': lambda_class, 'lambda_router_entropy': lambda_router_entropy})
+        log.update({'lambda_active': lambda_active, 'lambda_distill': lambda_distill, 'lambda_class': lambda_class})
 
         # train the model
         model.train()
         result, first_batch_data, first_batch_routing_maps = train_epoch(
             epoch, model, train_dataloader, optimizer, train_metrics, config, 
             lr_scheduler if config.lr_scheduler == 'cosine_with_warmup' else None,
-            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device, 
-            total_steps=config.train_steps,
+            lambda_active, lambda_distill, lambda_class, device,
             save_routing_viz=getattr(config, 'save_routing_viz', False)
         )
         log.update(result)
@@ -331,7 +322,7 @@ def main():
         model.eval()
         result, val_first_batch_data, val_first_batch_routing_maps = valid_epoch(
             epoch, model, valid_dataloader, optimizer, valid_metrics, 
-            lambda_active, lambda_distill, lambda_class, lambda_router_entropy, device,
+            lambda_active, lambda_distill, lambda_class, device,
             save_routing_viz=getattr(config, 'save_routing_viz', False)
         )
         log.update(**{'val_' + k: v for k, v in result.items()})

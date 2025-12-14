@@ -17,7 +17,6 @@ class ModelArgs:
     n_layers: int = 12
     n_heads: int = 12
     n_kv_heads: Optional[int] = 12
-
     norm_eps: float = 1e-5  
     lora_rank: int = 8
     dynamic_active_target: float = 0.4
@@ -25,11 +24,9 @@ class ModelArgs:
     dynamic_router_hdim: int = 512
     dynamic_reserve_initials: int = 1
     low_rank_dim: int = 256
-    block_size: int = 2  # Default to 2, because the code assumes at least 2
-
+    block_size: int = 2
     use_lora: bool = False
     use_reslr: bool = False
-    use_cosine_target_schedule: bool = True  # 是否使用余弦退火动态目标调度
 
     # from config.py
     image_size: Tuple[int, int] = (224, 224)
@@ -41,91 +38,49 @@ class ModelArgs:
 
 
 class DistillLoss(nn.Module):
-
+    """
+    蒸馏损失：计算 student 和 teacher 的 cls token 的 MSE 损失
+    """
     def __init__(self):
         super().__init__()
-        self.criterion = torch.nn.SmoothL1Loss()
+        self.criterion = torch.nn.MSELoss()
 
-    def forward(self, student_output, teacher_output, mask_inactive):
-
-        mask_sum = mask_inactive.sum() 
-    
-        if mask_sum > 1e-6:
-
-            bool_mask = mask_inactive.squeeze(-1).bool()
-            sparse_active = student_output[bool_mask]
-            full_active = teacher_output[bool_mask]
-
-            # target_for_full = sparse_active.detach() 
-            # loss_sparsity = self.criterion(full_active, target_for_full)
-
-            target_for_sparse = full_active.detach()
-            loss_commitment = self.criterion(sparse_active, target_for_sparse)
-
-            loss_alignment = loss_commitment
-            
-            return loss_alignment
-        
-        return torch.tensor(0.0, device=student_output.device)
+    def forward(self, student_cls: torch.Tensor, teacher_cls: torch.Tensor):
+        """
+        Args:
+            student_cls: student 路径的 cls token [batch, dim]
+            teacher_cls: teacher 路径的 cls token [batch, dim]
+        Returns:
+            MSE loss between student and teacher cls tokens
+        """
+        # teacher 作为目标，需要 detach 避免梯度反传
+        target = teacher_cls.detach()
+        loss = self.criterion(student_cls, target)
+        return loss
 
 class ActiveLoss(nn.Module):
-    def __init__(self, target, reserve_initials, use_cosine_schedule=True):
+    def __init__(self, target, reserve_initials):
 
         super().__init__()
         self.target = target
         self.reserve_initials = reserve_initials
-        self.use_cosine_schedule = use_cosine_schedule
-        
-        if self.use_cosine_schedule:
-            self.current_target = 1.0  # 初始目标值为1.0
-            self.final_target = target  # 最终目标值
-        else:
-            self.current_target = target  # 直接使用固定目标值
-            self.final_target = target
-
-    def update_target(self, current_step: int, total_steps: int):
-        """
-        使用余弦退火策略更新当前目标值
-        前期下降缓慢，后期加速，从1.0降到final_target
-        
-        Args:
-            current_step: 当前训练步数
-            total_steps: 总训练步数
-        """
-        if not self.use_cosine_schedule:
-            return  # 如果未启用余弦调度，直接返回
-            
-        if current_step >= total_steps:
-            self.current_target = self.final_target
-        else:
-            # 余弦退火公式: target = final + (initial - final) * (1 + cos(π * step / total)) / 2
-            # 这样前期(step接近0)下降缓慢，后期(step接近total)加速
-            import math
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * current_step / total_steps))
-            self.current_target = self.final_target + (1.0 - self.final_target) * cosine_decay
 
     @torch.no_grad()
     def metric(self, activation: torch.Tensor):
 
         activation = activation[:, self.reserve_initials:, :]
         metrics = {}
-        # 计算全局平均激活率（所有token和所有层）
         non_low_rank_ratio = activation.mean()  # 全局平均
         metrics.update({'non_low_rank_ratio': non_low_rank_ratio})
-        metrics.update({'current_target': self.current_target})  # 使用动态更新的current_target
+        metrics.update({'current_target': self.target})
         return metrics
-
 
     def forward(self, activation: torch.Tensor):
 
         activation = activation[:, self.reserve_initials:, :]  # [batch, seq_len, n_layers]
-        
-        # 计算全局平均激活率
-        global_active_ratio = activation.mean()  # 标量
-        
-        # target也应该是标量
-        target = torch.tensor(self.current_target, device=activation.device)
-        loss = F.l1_loss(global_active_ratio, target)
+        global_active_ratio = activation.mean()
+        target = torch.tensor(self.target, device=activation.device)
+        loss = F.mse_loss(global_active_ratio, target)
         
         return loss
 
@@ -177,8 +132,7 @@ class LayerNorm(nn.Module):
 
 class RouterModule(nn.Module):
     """
-    DynamicViT 风格的 Local-Global 上下文融合路由模块
-    核心改进：判断一个 Patch 是否重要，不仅看 Patch 自己，还要看它与整张图的关系
+    DynamicViT router
     """
     def __init__(
         self, 
@@ -193,17 +147,12 @@ class RouterModule(nn.Module):
         self.block_size = block_size
         self.reserve_initials = reserve_initials
         
-        # DynamicViT 风格的 Local-Global 融合
-        # 输入维度映射，为拼接 Global 特征做准备
+        # DynamicViT  Local-Global 
         self.in_conv = nn.Sequential(
             LayerNorm(in_dim, norm_eps, use_lora=use_lora),
             nn.Linear(in_dim, hidden_dim),
             nn.GELU()
         )
-
-        # Global 特征和 Local 特征拼接后的处理层
-        # 输入是 hidden_dim (local) + hidden_dim (global) = 2 * hidden_dim
-        # 输出是 block_size * 2 (对应二分类 logits: pass/keep)
         self.out_conv = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
@@ -212,10 +161,7 @@ class RouterModule(nn.Module):
             nn.Linear(hidden_dim // 2, block_size * 2),
         )
         
-        # 初始化权重 (参考 DynamicViT 的初始化)
-        # 最后一层初始化小一点，防止初始阶段梯度过大导致坍塌
         nn.init.normal_(self.out_conv[-1].weight, mean=0, std=0.01)
-        # 初始化 bias，使得初始状态倾向于保留完整路径 (bias > 0 for index 1)
         for i in range(block_size):
             self.out_conv[-1].bias.data[i*2] = 0.0       # pass path
             self.out_conv[-1].bias.data[i*2+1] = 5.0     # keep path (Full Transformer)
@@ -229,33 +175,18 @@ class RouterModule(nn.Module):
     def forward(self, x):
         # x shape: [Batch, SeqLen, Dim]
         B, N, C = x.shape
-        
-        # 1. 提取特征并降维
         x_embed = self.in_conv(x)  # [B, N, hidden_dim]
         
-        # 2. 提取 Global Context (全局平均池化)
-        # 注意要排除 reserve_initials (如 class token)，只对 patch tokens 做平均
-        # 只对 patch 做平均更能代表图像整体纹理
         if self.reserve_initials > 0:
             patch_tokens = x_embed[:, self.reserve_initials:, :]  # [B, N-reserve, hidden_dim]
             global_feat = torch.mean(patch_tokens, dim=1, keepdim=True)  # [B, 1, hidden_dim]
         else:
             global_feat = torch.mean(x_embed, dim=1, keepdim=True)
 
-        # 3. 扩展 Global 特征以匹配序列长度
         global_feat = global_feat.expand(B, N, -1)  # [B, N, hidden_dim]
-        
-        # 4. Local-Global 融合 (Concatenation)
-        # 融合后的维度是 [B, N, 2 * hidden_dim]
         fused_feat = torch.cat([x_embed, global_feat], dim=-1)
-        
-        # 5. 预测 Logits
         logits = self.out_conv(fused_feat)  # [B, N, block_size * 2]
-        
-        # 6. Reshape 回需要的格式 [Batch, SeqLen, BlockSize, 2]
         logits = logits.view(B, N, self.block_size, 2)
-        
-        # 计算soft概率用于熵正则化和 Ratio Loss
         soft_routing = F.softmax(logits, dim=-1)  # [B, N, block_size, 2]
         
         # 计算router熵（排除reserved tokens）
@@ -271,15 +202,12 @@ class RouterModule(nn.Module):
             idx = soft_routing.argmax(dim=-1, keepdim=True)
             hard_routing = torch.zeros_like(soft_routing).scatter_(-1, idx, 1.0)
         
-        # 强制保留 Class Token 等始终走完整路径
         if self.reserve_initials > 0:
-            # index 1 是 "Keep" / "Transformer Path"
             hard_routing[:, :self.reserve_initials, :, :] = 0
             hard_routing[:, :self.reserve_initials, :, 1] = 1
         
         indices = self._router2indices(hard_routing[:, :, :, 1])
 
-        # 返回 soft_routing 用于 Ratio Loss 的梯度传播
         return hard_routing, indices, router_entropy, soft_routing
     
 class Attention(nn.Module):
@@ -486,9 +414,20 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        teacher_x: Optional[torch.Tensor] = None,
         block_info: Optional[Dict] = None,
         LRA_mask: Optional[List[List[str]]] = None
     ):
+        """
+        Args:
+            x: student 路径的输入 [batch, seq_len, dim]
+            teacher_x: teacher 路径的输入 [batch, seq_len, dim]
+            block_info: 块信息字典
+            LRA_mask: 低秩近似掩码
+        Returns:
+            训练时: (teacher_out, student_out, w, block_info)
+            推理时: (student_out, w, block_info)
+        """
         bsz, seqlen, _ = x.shape
         if block_info is None:
             block_info = {}
@@ -498,7 +437,11 @@ class TransformerBlock(nn.Module):
             w = torch.ones((bsz, seqlen, 1), device=x.device)
             h = x + self.attention(self.attention_norm(x))
             out = h + self.feed_forward(self.ffn_norm(h))
-            return out, w, block_info
+            if self.training:
+                # 训练时 teacher 和 student 相同
+                return out, out, w, block_info
+            else:
+                return out, w, block_info
 
         # block_head need route and approximators
         if self.is_block_head:    
@@ -513,70 +456,77 @@ class TransformerBlock(nn.Module):
             block_info[f"block_{self.current_block_id}_routing"] = block_routing
             block_info[f"block_{self.current_block_id}_router_indices"] = router_indices
             block_info[f"block_{self.current_block_id}_router_entropy"] = router_entropy
-            block_info[f"block_{self.current_block_id}_soft_routing"] = soft_routing_probs  # 新增：用于 Ratio Loss
+            block_info[f"block_{self.current_block_id}_soft_routing"] = soft_routing_probs  # 用于 Ratio Loss
 
         # each layer need approximator or Transformer
         block_path_approximators = block_info[f"block_{self.current_block_id}_approximators"]
         block_routing = block_info[f"block_{self.current_block_id}_routing"]
         router_indices = block_info[f"block_{self.current_block_id}_router_indices"]
-        w = block_routing[:, :, self.current_block_pos:self.current_block_pos+1] # activate rate of current layer [batch, seq_len]
+        w = block_routing[:, :, self.current_block_pos:self.current_block_pos+1]  # [batch, seq_len, 1]
 
-        # attention_output
-        assert LRA_mask is not None, "LRA_mask must be provided"  # LRA_mask is not None, assert statement
+        # 获取路由掩码
+        assert LRA_mask is not None, "LRA_mask must be provided"
         LRA_mask_lora = torch.tensor(LRA_mask[self.current_block_pos][0], device=x.device)
-        lora_mask_indices = torch.isin(router_indices.long(), LRA_mask_lora.long()) # [bsz, seqlen, 1 ]
+        lora_mask_indices = torch.isin(router_indices.long(), LRA_mask_lora.long())  # [bsz, seqlen, 1]
         LRA_mask_transformer = torch.tensor(LRA_mask[self.current_block_pos][1], device=x.device)
-        attention_mask_indices = torch.isin(router_indices.long(), LRA_mask_transformer.long()) # [bsz, seqlen, 1 ]
+        attention_mask_indices = torch.isin(router_indices.long(), LRA_mask_transformer.long())  # [bsz, seqlen, 1]
 
         if self.training:
-            # 训练阶段：所有token互相可见，不使用mask
-            h = x + self.attention(self.attention_norm(x))
-            output = h + self.feed_forward(self.ffn_norm(h))
+            # ========== Teacher 路径：完整 Transformer 路径 ==========
+            if teacher_x is None:
+                teacher_x = x
+            h_teacher = teacher_x + self.attention(self.attention_norm(teacher_x))
+            teacher_out = h_teacher + self.feed_forward(self.ffn_norm(h_teacher))
 
-            # attention_output + ste_output
-            full_output = attention_mask_indices * output + (~attention_mask_indices) * x
-        
-            # attention_output + ste_output + low_rank_out
-            full_output = block_path_approximators(full_output, router_indices, LRA_mask_lora)
+            # ========== Student 路径：根据 Router 决策混合 ==========
+            # 先计算完整 Transformer 输出
+            h_student = x + self.attention(self.attention_norm(x))
+            transformer_out = h_student + self.feed_forward(self.ffn_norm(h_student))
+
+            # 根据 Router 决策混合：active tokens 用 transformer，inactive tokens 保持原始 x
+            student_out = attention_mask_indices * transformer_out + (~attention_mask_indices) * x
+            
+            # 低秩 approximator 处理 inactive tokens
+            student_out = block_path_approximators(student_out, router_indices, LRA_mask_lora)
+
+            return teacher_out, student_out, w, block_info
         else:
-            # 推理阶段：非对称attention，Q用active tokens，KV用所有tokens
+            # ========== 推理阶段：非对称 attention ==========
             x_normed = self.attention_norm(x)
             
-            # 获取active tokens的索引
+            # 获取 active tokens 的索引
             active_mask = attention_mask_indices.squeeze(-1)  # [bsz, seqlen]
             
-            # 构建active tokens作为Q
-            # 为了保持batch维度一致，使用masked方式处理
             bsz_local = x.shape[0]
             active_outputs = []
             
             for b in range(bsz_local):
                 batch_active_mask = active_mask[b]  # [seqlen]
                 x_q = x_normed[b:b+1, batch_active_mask, :]  # [1, num_active, dim]
-                x_kv = x_normed[b:b+1]  # [1, seqlen, dim] - 所有tokens
+                x_kv = x_normed[b:b+1]  # [1, seqlen, dim] - 所有 tokens
                 
-                # 非对称attention: Q=active, KV=all
+                # 非对称 attention: Q=active, KV=all
                 attn_out = self.attention(x_q, x_kv)  # [1, num_active, dim]
                 
-                # 构建完整输出，active位置用attention输出，inactive位置用原始x
+                # 构建完整输出，active 位置用 attention 输出，inactive 位置用原始 x
                 full_attn = x[b:b+1].clone()  # [1, seqlen, dim]
                 full_attn[:, batch_active_mask, :] = x[b:b+1, batch_active_mask, :] + attn_out
                 active_outputs.append(full_attn)
             
             h = torch.cat(active_outputs, dim=0)  # [bsz, seqlen, dim]
             
-            # FFN只对active tokens应用
+            # FFN 只对 active tokens 应用
             h_normed = self.ffn_norm(h)
             ffn_out = self.feed_forward(h_normed)
             output = h + ffn_out
             
-            # active tokens用transformer输出，inactive tokens保持原始x
-            full_output = attention_mask_indices * output + (~attention_mask_indices) * x
+            # active tokens 用 transformer 输出，inactive tokens 保持原始 x
+            student_out = attention_mask_indices * output + (~attention_mask_indices) * x
             
-            # 低秩approximator处理inactive tokens
-            full_output = block_path_approximators(full_output, router_indices, LRA_mask_lora)
+            # 低秩 approximator 处理 inactive tokens
+            student_out = block_path_approximators(student_out, router_indices, LRA_mask_lora)
 
-        return output, full_output, w, block_info, lora_mask_indices
+            return student_out, w, block_info
 
 
 class Transformer(nn.Module):
@@ -601,8 +551,7 @@ class Transformer(nn.Module):
         
         self.criterion_active = ActiveLoss(
             target=params.dynamic_active_target,
-            reserve_initials=params.dynamic_reserve_initials,
-            use_cosine_schedule=params.use_cosine_target_schedule
+            reserve_initials=params.dynamic_reserve_initials
         )
         self.criterion_distill = DistillLoss()
 
@@ -658,49 +607,82 @@ class Transformer(nn.Module):
         x = self.pos_embedding(x)
 
         self.acts = []
-        self.soft_routing_probs = []  # 新增：收集所有层的软概率用于 Ratio Loss
+        self.soft_routing_probs = []  # 收集所有层的软概率用于 Ratio Loss
         self.routing_maps = {}  # 存储每个block-head的路由值
         d_loss = torch.tensor(0.0, device=x.device)
         r_entropy = torch.tensor(0.0, device=x.device)  # 累积 router entropy
         block_info = {}
         
+        # 训练时维护两条路径
+        teacher_x = x.clone()  # Teacher 路径输入
+        student_x = x  # Student 路径输入
+        
         for layer in self.layers:
             # reslr
-            if self.use_reslr and layer.layer_id >= layer.dynamic_start_layer:  # pyright: ignore[reportOperatorIssue]
-                output, full_output, w, block_info, lora_mask_indices = layer(x, block_info, self.LRA_mask)
-                layer_d_loss = self.criterion_distill(full_output, output, lora_mask_indices)
-                d_loss += layer_d_loss
-                
-                # 累积 router entropy（只在block head层有值）
-                if layer.is_block_head:
-                    r_entropy += block_info[f"block_{layer.current_block_id}_router_entropy"]
-                    # 收集路由值用于可视化
-                    self.routing_maps[layer.current_block_id] = block_info[f"block_{layer.current_block_id}_routing"].detach()
-                    # 新增：收集软概率用于 Ratio Loss (DynamicViT 风格)
-                    soft_prob = block_info[f"block_{layer.current_block_id}_soft_routing"]  # [B, N, block_size]
-                    self.soft_routing_probs.append(soft_prob)
-                
-                x = full_output
+            if self.use_reslr and layer.layer_id >= layer.dynamic_start_layer:
+                if self.training:
+                    # 训练时：同时维护 teacher 和 student 路径
+                    teacher_out, student_out, w, block_info = layer(
+                        student_x, teacher_x, block_info, self.LRA_mask
+                    )
+                    
+                    # 计算 D_Loss：每层 cls token 的 MSE
+                    student_cls = student_out[:, 0, :]  # [batch, dim]
+                    teacher_cls = teacher_out[:, 0, :]  # [batch, dim]
+                    layer_d_loss = self.criterion_distill(student_cls, teacher_cls)
+                    d_loss += layer_d_loss
+                    
+                    # 累积 router entropy（只在 block head 层有值）
+                    if layer.is_block_head:
+                        r_entropy += block_info[f"block_{layer.current_block_id}_router_entropy"]
+                        # 收集路由值用于可视化
+                        self.routing_maps[layer.current_block_id] = block_info[f"block_{layer.current_block_id}_routing"].detach()
+                        # 收集软概率用于 Ratio Loss
+                        soft_prob = block_info[f"block_{layer.current_block_id}_soft_routing"]  # [B, N, block_size]
+                        self.soft_routing_probs.append(soft_prob)
+                    
+                    # 更新两条路径的输入
+                    teacher_x = teacher_out
+                    student_x = student_out
+                else:
+                    # 推理时：只有 student 路径
+                    student_out, w, block_info = layer(student_x, None, block_info, self.LRA_mask)
+                    
+                    if layer.is_block_head:
+                        r_entropy += block_info[f"block_{layer.current_block_id}_router_entropy"]
+                        self.routing_maps[layer.current_block_id] = block_info[f"block_{layer.current_block_id}_routing"].detach()
+                    
+                    student_x = student_out
 
             # naive vit or lora
             else:
-                output = layer(x, block_info)
-                x, w, block_info = output
+                if self.training:
+                    teacher_out, student_out, w, block_info = layer(student_x, teacher_x, block_info)
+                    teacher_x = teacher_out
+                    student_x = student_out
+                else:
+                    output = layer(student_x, None, block_info)
+                    student_x, w, block_info = output
                 
             self.acts.append(w)
         
         # norm
-        x = self.norm(x)
+        if self.training:
+            teacher_x = self.norm(teacher_x)
+            student_x = self.norm(student_x)
+        else:
+            student_x = self.norm(student_x)
 
         activation = torch.cat(self.acts, dim=-1)
 
-        output = self.classifier(x[:,0])
+        # C_Loss 由 student_out 产生，让梯度直接回传到 router
+        output = self.classifier(student_x[:, 0])
         self.logits = output
         c_loss = self.criterion(output, labels)
         
         # reslr
         if self.use_reslr:
-            # DynamicViT 风格：使用软概率计算 Ratio Loss，让梯度回传更顺畅
+            # DynamicViT 风格：使用软概率计算 Ratio Loss
             if len(self.soft_routing_probs) > 0:
                 # 拼接所有 block 的软概率 [B, N, total_blocks * block_size]
                 all_soft_probs = torch.cat(self.soft_routing_probs, dim=-1)
